@@ -26,3 +26,8 @@ Thumbs.db
 
 # Cursor local settings/cache
 .cursor/
+
+# Do not publish local API scripts / data dumps
+mys_api/
+RolesByStoken_data.json
+userFavourite_data.json
