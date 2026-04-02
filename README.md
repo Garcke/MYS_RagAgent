@@ -24,6 +24,16 @@
 - **寒暄优化**：如“你好”这类寒暄不会附带参考来源
 - **模型可配置**：Image/Audio/Embedding/QueryParser/Answer 均可在 `.env` 自定义
 
+### 界面预览
+
+**扫码登录**
+
+![扫码登录界面](docs/images/login-qrcode.png)
+
+**收藏夹看板**
+
+![收藏夹看板](docs/images/favourite-dashboard.png)
+
 ---
 
 ## 项目结构

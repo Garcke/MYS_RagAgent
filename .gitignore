@@ -18,6 +18,10 @@ data/chroma/
 *.gif
 *.log
 
+# 允许文档截图入库
+!docs/images/
+!docs/images/*.png
+
 # OS / IDE
 .DS_Store
 Thumbs.db
