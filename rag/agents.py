@@ -30,6 +30,20 @@ IMAGE_PROMPT = (
     "界面文字、活动奖励、场景描述等所有可见内容。尽量提取文字信息。"
 )
 
+IMAGE_AGENT_MODEL = os.getenv("IMAGE_AGENT_MODEL", "qwen-vl-max")
+AUDIO_AGENT_MODEL = os.getenv("AUDIO_AGENT_MODEL", "paraformer-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
+
+try:
+    MAX_IMAGES_PER_POST = max(1, int(os.getenv("IMAGE_AGENT_MAX_IMAGES_PER_POST", "3")))
+except ValueError:
+    MAX_IMAGES_PER_POST = 3
+
+try:
+    IMAGE_AGENT_INTERNAL_WORKERS = max(1, int(os.getenv("IMAGE_AGENT_INTERNAL_WORKERS", "3")))
+except ValueError:
+    IMAGE_AGENT_INTERNAL_WORKERS = 3
+
 # ── game_id 映射 ───────────────────────────────────────────
 GAME_PATH = {
     1: "bh3", 2: "ys", 3: "bh2",
@@ -73,7 +87,7 @@ def compute_quality_score(like_num: int, is_official: bool, created_at: int) -> 
 
 def get_embedding(text: str) -> List[float]:
     resp = TextEmbedding.call(
-        model=TextEmbedding.Models.text_embedding_v3,
+        model=EMBEDDING_MODEL,
         input=text,
     )
     if resp.status_code != 200:
@@ -82,7 +96,7 @@ def get_embedding(text: str) -> List[float]:
 
 
 def describe_image(image_url: str) -> str:
-    """调用 qwen-vl-max 生成图片描述"""
+    """调用视觉模型生成图片描述"""
     try:
         messages = [{
             "role": "user",
@@ -92,7 +106,7 @@ def describe_image(image_url: str) -> str:
             ],
         }]
         resp = MultiModalConversation.call(
-            model="qwen-vl-max",
+            model=IMAGE_AGENT_MODEL,
             messages=messages,
         )
         if resp.status_code != 200:
@@ -132,10 +146,10 @@ def pick_vod_url(vod: dict) -> str:
 
 
 def transcribe_video_audio(file_url: str) -> str:
-    """调用 paraformer-v2 对视频 URL 做转写"""
+    """调用音频模型对视频 URL 做转写"""
     try:
         resp = ParaformerTranscription.call(
-            model="paraformer-v2",
+            model=AUDIO_AGENT_MODEL,
             file_urls=[file_url],
             language_hints=["zh", "en"],
         )
@@ -270,7 +284,7 @@ def text_agent(state: ArchiveState) -> ArchiveState:
 # ── Image Agent ────────────────────────────────────────────
 
 def image_agent(state: ArchiveState) -> ArchiveState:
-    """图片 Agent：并发调用 qwen-vl-max 生成描述 → 构建文档"""
+    """图片 Agent：单图串行，多图并发调用 qwen-vl-max 生成描述"""
     if not state.get("has_image"):
         state["image_result"] = []
         return state
@@ -278,7 +292,29 @@ def image_agent(state: ArchiveState) -> ArchiveState:
     raw    = state["raw_data"]
     post   = raw.get("post", {})
     base   = build_base_metadata(raw)
-    images = (post.get("images", []) or [])[:5]  # 最多处理 5 张
+    images = (post.get("images", []) or [])[:MAX_IMAGES_PER_POST]  # 限制图片数量，控制单帖耗时
+
+    results = []
+
+    # 只有多图时才并发识别
+    if len(images) <= 1:
+        for i, img_url in enumerate(images):
+            description = describe_image(img_url)
+            if not description:
+                continue
+            doc_id   = f"doc_{base['post_id']}_image_{i:03d}"
+            document = f"[图片描述] {description}"
+            meta     = {
+                **base,
+                "modality":    "image",
+                "media_url":   img_url,
+                "chunk_index": i,
+            }
+            results.append({"doc_id": doc_id, "document": document, "metadata": meta})
+            print(f"[ImageAgent] post={base['post_id']} img={i} 描述完成")
+
+        state["image_result"] = results
+        return state
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -287,8 +323,7 @@ def image_agent(state: ArchiveState) -> ArchiveState:
         description = describe_image(img_url)
         return i, img_url, description
 
-    results = []
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=IMAGE_AGENT_INTERNAL_WORKERS) as executor:
         futures = {executor.submit(process_image, (i, url)): i
                    for i, url in enumerate(images)}
         # 按原始顺序收集结果
@@ -412,7 +447,7 @@ def indexer_agent(state: ArchiveState) -> ArchiveState:
 # ── 归档入口 ───────────────────────────────────────────────
 
 def archive_post(raw_item: dict) -> dict:
-    """归档单条收藏帖（Router → Text + Image → Merge → Index）"""
+    """归档单条收藏帖（Router → Text/Image/Audio 并发 → Merge → Index）"""
     post_id = str(raw_item.get("post", {}).get("post_id", ""))
     if not post_id:
         return {"error": "无效的 post_id"}
@@ -433,33 +468,110 @@ def archive_post(raw_item: dict) -> dict:
         "index_status": {},
     }
     state = router_agent(state)
-    state = text_agent(state)
-    state = image_agent(state)
-    state = audio_agent(state)
+
+    # 帖内并发：Text / Image / Audio 各自使用独立 state，避免共享可变状态竞争
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _run_text() -> tuple[list, float]:
+        start = time.perf_counter()
+        local_state: ArchiveState = {
+            **state,
+            "text_result": [],
+            "image_result": [],
+            "audio_result": [],
+            "unified_docs": [],
+            "index_status": {},
+        }
+        docs = text_agent(local_state).get("text_result", [])
+        return docs, time.perf_counter() - start
+
+    def _run_image() -> tuple[list, float]:
+        start = time.perf_counter()
+        local_state: ArchiveState = {
+            **state,
+            "text_result": [],
+            "image_result": [],
+            "audio_result": [],
+            "unified_docs": [],
+            "index_status": {},
+        }
+        docs = image_agent(local_state).get("image_result", [])
+        return docs, time.perf_counter() - start
+
+    def _run_audio() -> tuple[list, float]:
+        start = time.perf_counter()
+        local_state: ArchiveState = {
+            **state,
+            "text_result": [],
+            "image_result": [],
+            "audio_result": [],
+            "unified_docs": [],
+            "index_status": {},
+        }
+        docs = audio_agent(local_state).get("audio_result", [])
+        return docs, time.perf_counter() - start
+
+    t_text = t_image = t_audio = 0.0
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_text = executor.submit(_run_text) if state.get("has_text") else None
+        future_image = executor.submit(_run_image) if state.get("has_image") else None
+        future_audio = executor.submit(_run_audio) if state.get("has_video") else None
+
+        if future_text:
+            state["text_result"], t_text = future_text.result()
+        else:
+            state["text_result"] = []
+
+        if future_image:
+            state["image_result"], t_image = future_image.result()
+        else:
+            state["image_result"] = []
+
+        if future_audio:
+            state["audio_result"], t_audio = future_audio.result()
+        else:
+            state["audio_result"] = []
+
+    print(
+        f"[ArchiveTiming] post={post_id} "
+        f"text={t_text:.2f}s({len(state['text_result'])}) "
+        f"image={t_image:.2f}s({len(state['image_result'])}) "
+        f"audio={t_audio:.2f}s({len(state['audio_result'])})"
+    )
+
     state = merge_agent(state)
     state = indexer_agent(state)
     return {"post_id": post_id, "status": "ok", **state["index_status"]}
 
 
-def archive_favourite_list(items: list) -> dict:
-    """批量归档收藏夹列表（并发处理帖子）"""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+def archive_favourite_list(items: list, progress_cb=None) -> dict:
+    """批量归档收藏夹列表（按帖子顺序执行，不做跨帖并发）"""
+    total = len(items)
+    results = {"total": total, "indexed": 0, "skipped": 0, "errors": 0}
+    completed = 0
 
-    results = {"total": len(items), "indexed": 0, "skipped": 0, "errors": 0}
-
-    # 最多 3 个帖子并发，避免超出 DashScope QPS 限制
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(archive_post, item): item for item in items}
-        for future in as_completed(futures):
-            try:
-                r = future.result()
-                if r.get("status") == "ok":
-                    results["indexed"] += r.get("indexed", 0)
-                elif r.get("status") == "skipped":
-                    results["skipped"] += 1
-                else:
-                    results["errors"] += 1
-            except Exception as e:
-                print(f"[Archive] 失败: {e}")
+    for item in items:
+        last_result = None
+        try:
+            r = archive_post(item)
+            last_result = r
+            if r.get("status") == "ok":
+                results["indexed"] += r.get("indexed", 0)
+            elif r.get("status") == "skipped":
+                results["skipped"] += 1
+            else:
                 results["errors"] += 1
+        except Exception as e:
+            print(f"[Archive] 失败: {e}")
+            results["errors"] += 1
+            last_result = {"status": "error", "error": str(e)}
+        finally:
+            completed += 1
+            if progress_cb:
+                try:
+                    progress_cb(completed, total, last_result, dict(results))
+                except Exception as cb_err:
+                    print(f"[Archive] progress_cb 异常: {cb_err}")
+
     return results

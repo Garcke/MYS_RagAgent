@@ -3,23 +3,96 @@ let qrSession = null, pollTimer = null, userCookie = null, userRoles = null;
 
 // ── 登录弹窗控制 ────────────────────────────────────────
 let qrRefreshTimer = null;
+let qrCountdownTimer = null;
+let qrCountdown = 60;
+
+function resetStepState() {
+  ['login-step-1', 'login-step-2', 'login-step-3'].forEach((id, idx) => {
+    const el = $(id);
+    if (!el) return;
+    el.classList.remove('step-active', 'step-done');
+    if (idx === 0) el.classList.add('step-active');
+  });
+  ['login-step-connector-1', 'login-step-connector-2'].forEach(id => {
+    const c = $(id);
+    if (!c) return;
+    c.classList.remove('active', 'done');
+  });
+}
+
+function setStepState(step) {
+  const s1 = $('login-step-1'), s2 = $('login-step-2'), s3 = $('login-step-3');
+  const c1 = $('login-step-connector-1'), c2 = $('login-step-connector-2');
+  if (!s1 || !s2 || !s3 || !c1 || !c2) return;
+
+  [s1, s2, s3].forEach(x => x.classList.remove('step-active', 'step-done'));
+  [c1, c2].forEach(x => x.classList.remove('active', 'done'));
+
+  if (step === 1) {
+    s1.classList.add('step-active');
+  } else if (step === 2) {
+    s1.classList.add('step-done');
+    c1.classList.add('done');
+    s2.classList.add('step-active');
+  } else if (step >= 3) {
+    s1.classList.add('step-done');
+    s2.classList.add('step-done');
+    c1.classList.add('done');
+    c2.classList.add('done');
+    s3.classList.add('step-active');
+  }
+}
+
+function setPillState(text, stateClass = '') {
+  const pill = $('qr-state-pill');
+  if (!pill) return;
+  pill.textContent = text;
+  pill.classList.remove('state-waiting', 'state-confirm', 'state-success', 'state-error');
+  if (stateClass) pill.classList.add(stateClass);
+}
+
+function startQRCountdown() {
+  stopQRCountdown();
+  qrCountdown = 60;
+  qrCountdownTimer = setInterval(() => {
+    qrCountdown = Math.max(0, qrCountdown - 1);
+    const hintLeft = $('qr-hint-left');
+    if (hintLeft && qrSession) {
+      hintLeft.textContent = `二维码已生成，等待扫码（${qrCountdown}s 后自动刷新）`;
+    }
+    if (qrCountdown <= 0) {
+      stopQRCountdown();
+    }
+  }, 1000);
+}
+
+function stopQRCountdown() {
+  if (qrCountdownTimer) {
+    clearInterval(qrCountdownTimer);
+    qrCountdownTimer = null;
+  }
+}
+
 function openLoginModal() {
   $('login-modal').classList.add('show');
   $('login-modal-overlay').classList.add('show');
+  resetStepState();
+  setPillState('准备中');
   // 打开弹窗时自动生成二维码
   setTimeout(() => generateQR(), 300);
-  // 每 2 分钟自动刷新一次二维码
+  // 每 1 分钟自动刷新一次二维码
   if (qrRefreshTimer) clearInterval(qrRefreshTimer);
   qrRefreshTimer = setInterval(() => {
     if ($('login-modal').classList.contains('show')) {
       generateQR();
     }
-  }, 120000);
+  }, 60000);
 }
 function closeLoginModal() {
   $('login-modal').classList.remove('show');
   $('login-modal-overlay').classList.remove('show');
   stopPoll();
+  stopQRCountdown();
   if (qrRefreshTimer) clearInterval(qrRefreshTimer);
 }
 
@@ -48,6 +121,7 @@ function toast(msg, ms = 2800) {
 // ── 扫码登录 ────────────────────────────────────────────────
 async function generateQR() {
   stopPoll();
+  stopQRCountdown();
   $('qr-img').style.display = 'none';
   $('qr-ph').style.display = 'none';
   $('qr-loading').classList.add('show');
@@ -58,8 +132,8 @@ async function generateQR() {
   hint.textContent = '';
   const hintLeft = $('qr-hint-left');
   if (hintLeft) hintLeft.textContent = '二维码生成中...';
-  const pill = $('qr-state-pill');
-  if (pill) pill.textContent = '生成中';
+  setPillState('生成中');
+  setStepState(1);
   setStatus('amber', '生成中...');
 
   try {
@@ -78,16 +152,20 @@ async function generateQR() {
 
     $('qr-loading').classList.remove('show');
     hint.textContent = '';
-    if (hintLeft) hintLeft.textContent = '二维码已生成';
-    if (pill) pill.textContent = '等待扫码';
+    if (hintLeft) hintLeft.textContent = '二维码已生成，等待扫码（60s 后自动刷新）';
+    setPillState('等待扫码', 'state-waiting');
+    setStepState(1);
     setStatus('amber', '等待扫码');
+    startQRCountdown();
     startPoll();
   } catch (e) {
     $('qr-loading').classList.remove('show');
     $('qr-ph').style.display = 'flex';
     hint.textContent = '生成失败，请重试';
-    if (hintLeft) hintLeft.textContent = '生成失败';
-    if (pill) pill.textContent = '生成失败';
+    if (hintLeft) {
+      hintLeft.innerHTML = '生成失败，<button class="qr-hint-action" onclick="generateQR()">立即重试</button>';
+    }
+    setPillState('生成失败', 'state-error');
     setStatus('', '未登录');
     toast('二维码生成失败：' + e.message);
   }
@@ -108,13 +186,14 @@ async function pollStatus() {
 
     if (data.status === 'confirmed') {
       stopPoll();
+      stopQRCountdown();
       $('qr-confirmed').classList.add('show');
       hint.className = 'qr-hint confirmed';
       hint.textContent = '登录成功！正在加载收藏夹...';
       const hintLeft = $('qr-hint-left');
       if (hintLeft) hintLeft.textContent = '登录成功，正在进入...';
-      const pill = $('qr-state-pill');
-      if (pill) pill.textContent = '登录成功';
+      setPillState('登录成功', 'state-success');
+      setStepState(3);
       setStatus('golden', '已登录');
       userCookie = data.credentials;
       saveCredentials(data.credentials);
@@ -124,18 +203,20 @@ async function pollStatus() {
       hint.className = 'qr-hint scanning';
       hint.textContent = '';
       const hintLeft = $('qr-hint-left');
-      const pill = $('qr-state-pill');
 
       // 后端会返回 stat: Init / Scanned / Confirmed
       // 这里只在 Scanned 时显示“待确认”
       if (data.stat === 'Scanned') {
+        stopQRCountdown();
         if (hintLeft) hintLeft.textContent = '已扫码，等待 App 确认';
-        if (pill) pill.textContent = '待确认';
+        setPillState('待确认', 'state-confirm');
+        setStepState(2);
         setStatus('amber', '等待确认');
       } else {
         // Init 或其他未确认状态
-        if (hintLeft) hintLeft.textContent = '二维码已生成，等待扫码';
-        if (pill) pill.textContent = '等待扫码';
+        if (hintLeft) hintLeft.textContent = `二维码已生成，等待扫码（${qrCountdown}s 后自动刷新）`;
+        setPillState('等待扫码', 'state-waiting');
+        setStepState(1);
         setStatus('amber', '等待扫码');
       }
     }
@@ -230,6 +311,7 @@ let activeGameId = 0;    // 0 = 全部
 let ingestScopeChoice = null;
 let ingestPendingGameIds = new Set();
 let ingestedGames = loadIngestedGames();
+let ingestProgressPoll = null;
 
 function loadIngestedGames() {
   try {
@@ -410,8 +492,9 @@ function logout() {
   $('qr-hint').textContent = '';
   const hintLeft = $('qr-hint-left');
   if (hintLeft) hintLeft.textContent = '等待二维码生成...';
-  const pill = $('qr-state-pill');
-  if (pill) pill.textContent = '准备中';
+  resetStepState();
+  setPillState('准备中');
+  stopQRCountdown();
   setStatus('', '未登录');
   openLoginModal();
 }
@@ -469,7 +552,24 @@ async function confirmIngestScope() {
   await ingestFavourites(ingestScopeChoice);
 }
 
-// ── RAG 归档 ────────────────────────────────────────────────
+function stopIngestProgressPoll() {
+  if (ingestProgressPoll) {
+    clearInterval(ingestProgressPoll);
+    ingestProgressPoll = null;
+  }
+}
+
+function renderIngestProgress(statusEl, current, total, label = '正在归档中') {
+  statusEl.innerHTML = `
+    <div class="ingest-progress">
+      <div class="ingest-progress-label">${label} ${current}/${total}</div>
+      <div class="ingest-progress-track">
+        <div class="ingest-progress-bar"></div>
+      </div>
+    </div>
+  `;
+}
+
 async function ingestFavourites(scope = 'current') {
   const c = userCookie || {};
   const role = (userRoles && userRoles.length) ? userRoles[0] : null;
@@ -487,23 +587,82 @@ async function ingestFavourites(scope = 'current') {
   buildGameTabs(allItems);
 
   btn.disabled = true;
-  statusEl.innerHTML = '<div class="spinner" style="width:14px;height:14px;border-width:2px"></div> <span>提交中...</span>';
+  stopIngestProgressPoll();
+  renderIngestProgress(statusEl, 0, 1, '正在提交任务...');
+
   try {
-    const res = await fetch(API + '/rag/ingest/favourites', {
+    const startRes = await fetch(API + '/rag/ingest/favourites/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        stuid:       c.stuid || '',
-        stoken:      c.stoken || '',
-        mid:         c.mid || '',
-        game_uid:    role ? role.game_uid : '',
+        stuid: c.stuid || '',
+        stoken: c.stoken || '',
+        mid: c.mid || '',
+        game_uid: role ? role.game_uid : '',
         game_region: role ? role.region : 'cn_gf01',
-        size:        20,
+        size: 20,
         selected_game_id: selectedGameId
       })
     });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || '归档失败');
+
+    const startData = await startRes.json();
+    if (!startRes.ok) throw new Error(startData.detail || '归档启动失败');
+
+    const taskId = startData.task_id;
+    if (!taskId) throw new Error('归档任务创建失败');
+
+    let finalData = null;
+
+    const pollOnce = async () => {
+      const pRes = await fetch(`${API}/rag/ingest/favourites/progress?task_id=${encodeURIComponent(taskId)}`);
+      const pData = await pRes.json();
+      if (!pRes.ok) throw new Error(pData.detail || '进度查询失败');
+
+      const current = Number(pData.current || 0);
+      const total = Number(pData.total || startData.total || 0);
+      renderIngestProgress(statusEl, current, total || 1, '正在归档中');
+
+      if (pData.status === 'done') {
+        finalData = pData;
+        stopIngestProgressPoll();
+      } else if (pData.status === 'error') {
+        throw new Error(pData.message || '归档失败');
+      }
+    };
+
+    await pollOnce();
+
+    if (!finalData) {
+      ingestProgressPoll = setInterval(async () => {
+        try {
+          await pollOnce();
+          if (finalData) {
+            targetGameIds.forEach(gid => {
+              ingestedGames[String(gid)] = {
+                ingested: true,
+                at: Date.now()
+              };
+              ingestPendingGameIds.delete(gid);
+            });
+            saveIngestedGames();
+            buildGameTabs(allItems);
+
+            statusEl.innerHTML = `<span class="ingest-status-success">✓ ${finalData.message || '归档完成'}</span>`;
+            toast(finalData.message || '归档完成');
+            setTimeout(loadRAGStats, 800);
+            btn.disabled = false;
+          }
+        } catch (pollErr) {
+          stopIngestProgressPoll();
+          targetGameIds.forEach(gid => ingestPendingGameIds.delete(gid));
+          buildGameTabs(allItems);
+          statusEl.innerHTML = `<span class="ingest-status-error">✗ ${pollErr.message}</span>`;
+          toast('归档失败：' + pollErr.message);
+          btn.disabled = false;
+        }
+      }, 1500);
+      return;
+    }
 
     targetGameIds.forEach(gid => {
       ingestedGames[String(gid)] = {
@@ -515,16 +674,19 @@ async function ingestFavourites(scope = 'current') {
     saveIngestedGames();
     buildGameTabs(allItems);
 
-    statusEl.innerHTML = `<span style="color:var(--success)">✓ ${data.message}</span>`;
-    toast(data.message);
-    setTimeout(loadRAGStats, 3000);
+    statusEl.innerHTML = `<span class="ingest-status-success">✓ ${finalData.message || '归档完成'}</span>`;
+    toast(finalData.message || '归档完成');
+    setTimeout(loadRAGStats, 800);
   } catch (e) {
+    stopIngestProgressPoll();
     targetGameIds.forEach(gid => ingestPendingGameIds.delete(gid));
     buildGameTabs(allItems);
-    statusEl.innerHTML = `<span style="color:#e05">✗ ${e.message}</span>`;
+    statusEl.innerHTML = `<span class="ingest-status-error">✗ ${e.message}</span>`;
     toast('归档失败：' + e.message);
   } finally {
-    btn.disabled = false;
+    if (!ingestProgressPoll) {
+      btn.disabled = false;
+    }
   }
 }
 

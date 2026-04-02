@@ -3,6 +3,7 @@ import io
 import json
 import random
 import string
+import threading
 import time
 import uuid
 from hashlib import md5
@@ -216,8 +217,25 @@ app.add_middleware(
 # 挂载静态文件目录
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# 入库任务进度（内存态）
+_ingest_tasks: dict[str, dict] = {}
+_ingest_tasks_lock = threading.Lock()
 
-# ── Pydantic 模型 ───────────────────────────────────────────────
+
+def _set_ingest_task(task_id: str, payload: dict):
+    with _ingest_tasks_lock:
+        if task_id not in _ingest_tasks:
+            _ingest_tasks[task_id] = {}
+        _ingest_tasks[task_id].update(payload)
+        _ingest_tasks[task_id]["updated_at"] = int(time.time())
+
+
+def _get_ingest_task(task_id: str) -> dict | None:
+    with _ingest_tasks_lock:
+        task = _ingest_tasks.get(task_id)
+        return dict(task) if task else None
+
+
 
 class FavouriteRequest(BaseModel):
     stuid: str
@@ -360,46 +378,156 @@ class RAGQueryRequest(BaseModel):
     game_id: int | None = None
 
 
+def _collect_favourite_items(req: RAGIngestRequest) -> list:
+    """全量翻页拉取并按分区筛选收藏帖"""
+    all_items = []
+    offset = ""
+    page_size = 20
+    max_pages = 50
+
+    for _ in range(max_pages):
+        fav_data = get_favourite(
+            stuid=req.stuid,
+            stoken=req.stoken,
+            mid=req.mid,
+            game_uid=req.game_uid,
+            game_region=req.game_region,
+            offset=offset,
+            size=page_size,
+        )
+        if fav_data.get("retcode") != 0:
+            raise HTTPException(status_code=400, detail=fav_data.get("message", "收藏夹获取失败"))
+
+        data = fav_data.get("data") or {}
+        page = data.get("list") or []
+        all_items.extend(page)
+
+        is_last = data.get("is_last", True)
+        if is_last or len(page) < page_size:
+            break
+        offset = data.get("next_offset") or ""
+
+    if req.selected_game_id is not None:
+        all_items = [
+            item for item in all_items
+            if (item.get("post") or {}).get("game_id") == req.selected_game_id
+        ]
+
+    return all_items
+
+
+def _enrich_vod_list(items: list, stuid: str, stoken: str, mid: str):
+    """对 vod_list 为空的帖子，调用详情接口补全"""
+    for item in items:
+        post = item.get("post", {})
+        if not item.get("vod_list"):
+            try:
+                full = get_post_full(str(post.get("post_id", "")), stuid, stoken, mid)
+                full_data = (full.get("data") or {})
+                full_post_obj = full_data.get("post") or {}
+                full_vod = full_post_obj.get("vod_list") or []
+                if full_vod:
+                    item["vod_list"] = full_vod
+            except Exception as e:
+                print(f"[Ingest] post={post.get('post_id')} 补全 vod_list 失败: {e}")
+
+
+@app.post("/api/rag/ingest/favourites/start")
+async def rag_ingest_start(req: RAGIngestRequest):
+    """启动归档任务，返回 task_id"""
+    try:
+        all_items = _collect_favourite_items(req)
+        scope_label = f"分区 {req.selected_game_id}" if req.selected_game_id is not None else "全部分区"
+
+        task_id = str(uuid.uuid4())
+        total = len(all_items)
+        _set_ingest_task(task_id, {
+            "task_id": task_id,
+            "status": "running",
+            "current": 0,
+            "total": total,
+            "indexed": 0,
+            "skipped": 0,
+            "errors": 0,
+            "message": f"归档进行中（{scope_label}）",
+            "selected_game_id": req.selected_game_id,
+        })
+
+        if total == 0:
+            _set_ingest_task(task_id, {
+                "status": "done",
+                "message": "所选分区收藏为空，无需归档",
+            })
+            return {
+                "status": "ok",
+                "task_id": task_id,
+                "total": 0,
+                "selected_game_id": req.selected_game_id,
+                "message": "所选分区收藏为空，无需归档",
+            }
+
+        import asyncio
+
+        def _run_task():
+            try:
+                _enrich_vod_list(all_items, req.stuid, req.stoken, req.mid)
+
+                def _on_progress(current, total_count, _last_result, partial):
+                    _set_ingest_task(task_id, {
+                        "status": "running",
+                        "current": current,
+                        "total": total_count,
+                        "indexed": partial.get("indexed", 0),
+                        "skipped": partial.get("skipped", 0),
+                        "errors": partial.get("errors", 0),
+                        "message": f"归档进行中：{current}/{total_count}",
+                    })
+
+                result = archive_favourite_list(all_items, progress_cb=_on_progress)
+                _set_ingest_task(task_id, {
+                    "status": "done",
+                    "current": result.get("total", 0),
+                    "total": result.get("total", 0),
+                    "indexed": result.get("indexed", 0),
+                    "skipped": result.get("skipped", 0),
+                    "errors": result.get("errors", 0),
+                    "message": f"归档完成（{scope_label}）：共 {result.get('total', 0)} 篇，新增 {result.get('indexed', 0)} 块，跳过 {result.get('skipped', 0)} 篇，失败 {result.get('errors', 0)} 篇",
+                })
+            except Exception as e:
+                _set_ingest_task(task_id, {
+                    "status": "error",
+                    "message": str(e),
+                })
+
+        asyncio.get_event_loop().run_in_executor(None, _run_task)
+
+        return {
+            "status": "ok",
+            "task_id": task_id,
+            "total": total,
+            "selected_game_id": req.selected_game_id,
+            "message": f"归档任务已启动（{scope_label}）",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rag/ingest/favourites/progress")
+async def rag_ingest_progress(task_id: str = Query(...)):
+    """查询归档任务进度"""
+    task = _get_ingest_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="任务不存在")
+    return task
+
+
 @app.post("/api/rag/ingest/favourites")
 async def rag_ingest(req: RAGIngestRequest):
-    """拉取收藏夹（全量翻页）并归档到 RAG 知识库"""
+    """兼容旧接口：同步执行归档"""
     try:
-        # 全量翻页拉取收藏夹
-        all_items = []
-        offset = ""
-        page_size = 20
-        max_pages = 50  # 最多拉 50 页，防止死循环
-
-        for _ in range(max_pages):
-            fav_data = get_favourite(
-                stuid=req.stuid,
-                stoken=req.stoken,
-                mid=req.mid,
-                game_uid=req.game_uid,
-                game_region=req.game_region,
-                offset=offset,
-                size=page_size,
-            )
-            if fav_data.get("retcode") != 0:
-                raise HTTPException(status_code=400, detail=fav_data.get("message", "收藏夹获取失败"))
-
-            data   = fav_data.get("data") or {}
-            page   = data.get("list") or []
-            all_items.extend(page)
-
-            # 判断是否还有更多页
-            is_last = data.get("is_last", True)
-            if is_last or len(page) < page_size:
-                break
-            # 使用 next_offset 翻页（米游社 API 用字符串游标）
-            offset = data.get("next_offset") or ""
-
-        # 按分区筛选（selected_game_id 存在时）
-        if req.selected_game_id is not None:
-            all_items = [
-                item for item in all_items
-                if (item.get("post") or {}).get("game_id") == req.selected_game_id
-            ]
+        all_items = _collect_favourite_items(req)
 
         if not all_items:
             return {
@@ -409,21 +537,8 @@ async def rag_ingest(req: RAGIngestRequest):
                 "selected_game_id": req.selected_game_id,
             }
 
-        # 对 vod_list 为空的帖子，调用详情接口补全
-        for item in all_items:
-            post = item.get("post", {})
-            if not item.get("vod_list"):  # vod_list 在 item 顶层
-                try:
-                    full = get_post_full(str(post.get("post_id", "")), req.stuid, req.stoken, req.mid)
-                    full_data = (full.get("data") or {})
-                    full_post_obj = full_data.get("post") or {}
-                    full_vod = full_post_obj.get("vod_list") or []
-                    if full_vod:
-                        item["vod_list"] = full_vod
-                except Exception as e:
-                    print(f"[Ingest] post={post.get('post_id')} 补全 vod_list 失败: {e}")
+        _enrich_vod_list(all_items, req.stuid, req.stoken, req.mid)
 
-        # 异步归档（在线程池中执行避免阻塞）
         import asyncio
         result = await asyncio.get_event_loop().run_in_executor(
             None, archive_favourite_list, all_items

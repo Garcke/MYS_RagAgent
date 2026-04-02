@@ -3,10 +3,10 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
-  <title>米游社收藏夹 · AI 知识库</title>
+  <title>米游社收藏知识库</title>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
-  <link rel="stylesheet" href="/static/style.css?v=9"/>
+  <link rel="stylesheet" href="/static/style.css?v=15"/>
   <script src="/static/marked.min.js"></script>
   <script>
     (function() {
@@ -60,23 +60,23 @@
         </div>
 
         <div class="steps-vertical">
-          <div class="step-v">
+          <div class="step-v" id="login-step-1">
             <div class="step-v-num">1</div>
             <div class="step-v-text">
               <div class="step-v-title">自动生成二维码</div>
               <div class="step-v-desc">页面加载时自动生成</div>
             </div>
           </div>
-          <div class="step-v-connector"></div>
-          <div class="step-v">
+          <div class="step-v-connector" id="login-step-connector-1"></div>
+          <div class="step-v" id="login-step-2">
             <div class="step-v-num">2</div>
             <div class="step-v-text">
               <div class="step-v-title">App 扫码确认</div>
               <div class="step-v-desc">在米游社 App 内确认</div>
             </div>
           </div>
-          <div class="step-v-connector"></div>
-          <div class="step-v">
+          <div class="step-v-connector" id="login-step-connector-2"></div>
+          <div class="step-v" id="login-step-3">
             <div class="step-v-num">3</div>
             <div class="step-v-text">
               <div class="step-v-title">进入应用</div>
@@ -136,7 +136,10 @@
   <!-- Logo -->
   <div class="sidebar-logo">
     <img src="https://bbs-static.miyoushe.com/communityweb/upload/6d7c2aab3ecf5932985e3aa5ccd7c0d7.png?x-oss-process=image/resize,s_400,l_16000/auto-orient,0/interlace,1/quality,q_70/format,webp" alt="logo"/>
-    <span class="sidebar-logo-text"><b>米游社</b> AI 收藏</span>
+    <div class="sidebar-logo-text">
+      <div class="logo-title"><b>米游社</b>收藏知识库</div>
+      <div class="logo-subtitle">收藏 · 问答 · 归档</div>
+    </div>
   </div>
 
   <!-- 登录状态 -->
@@ -235,7 +238,7 @@
 </div>
 
 <div id="toast"></div>
-<script src="/static/app.js?v=16"></script>
+<script src="/static/app.js?v=22"></script>
 <script>
 // 左右布局的视图切换（替代原来的 tab 切换）
 function switchView(view, btn) {

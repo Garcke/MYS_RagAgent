@@ -15,7 +15,9 @@ from . import chroma
 load_dotenv()
 dashscope.api_key = os.getenv("DASHSCOPE_API_KEY", "")
 
-LLM_MODEL = "qwen-max"
+QUERY_PARSER_MODEL = os.getenv("QUERY_PARSER_MODEL", "qwen-max")
+ANSWER_MODEL = os.getenv("ANSWER_MODEL", "qwen-max")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-v3")
 
 # game_id 映射（用于 Query Parser 实体识别）
 GAME_NAMES = {
@@ -69,7 +71,7 @@ def parse_query(question: str) -> dict:
 
     try:
         resp = Generation.call(
-            model=LLM_MODEL,
+            model=QUERY_PARSER_MODEL,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user",   "content": question},
@@ -114,7 +116,7 @@ def parse_query(question: str) -> dict:
 
 def retrieve(query_text: str, n_results: int = 50, where: dict = None) -> list:
     resp = TextEmbedding.call(
-        model=TextEmbedding.Models.text_embedding_v3,
+        model=EMBEDDING_MODEL,
         input=query_text,
     )
     if resp.status_code != 200:
@@ -214,7 +216,7 @@ def assemble_context(chunks: list) -> tuple:
 # ── LLM 生成 ───────────────────────────────────────────────
 
 def generate_answer(question: str, context: str, sources: list) -> tuple:
-    """调用 qwen-max 生成回答，同时返回实际引用的 sources"""
+    """调用回答模型生成回答，同时返回实际引用的 sources"""
     # 给每个知识卡片编号，用于引用追踪
     source_ids = [s["post_id"] for s in sources]
     system_prompt = (
@@ -234,7 +236,7 @@ def generate_answer(question: str, context: str, sources: list) -> tuple:
         {"role": "user",   "content": f"知识卡片：\n\n{context}\n\n用户问题：{question}"},
     ]
     resp = Generation.call(
-        model=LLM_MODEL,
+        model=ANSWER_MODEL,
         messages=messages,
         result_format="message",
     )
