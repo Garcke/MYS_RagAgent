@@ -28,11 +28,12 @@
 
 **扫码登录**
 
-![扫码登录界面](docs/images/login-qrcode.png)
+[![扫码登录界面](docs/images/login-qrcode.png)](docs/images/login-qrcode.png)
 
 **收藏夹看板**
 
-![收藏夹看板](docs/images/favourite-dashboard.png)
+[![收藏夹看板](docs/images/favourite-dashboard.png)](docs/images/favourite-dashboard.png)
+
 
 ---
 
